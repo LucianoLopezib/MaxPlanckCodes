@@ -1,113 +1,116 @@
 """
 ================================================================================
-Tortoise Yearly Cycle Simulation — CPU Version
+Patagonian Tortoise Yearly Cycle Simulation -- CPU version ("nightly reset" model)
 ================================================================================
 
 OVERVIEW
 --------
-This code simulates the 2D random-walk movement of desert tortoises over a full
-yearly cycle. Each tortoise is simulated independently for T timesteps (default
-~1 year at 1.7 s/step) using a lognormal step-length distribution and a
-Gaussian angular noise model. The simulation is JIT-compiled with Numba for
-speed, and N_SIM parallel runs are executed sequentially on the CPU.
+Simulates the 2D movement of Patagonian tortoises (Chelonoidis chilensis) over
+a full yearly cycle as a stop-and-go correlated random walk. Each tortoise is
+simulated independently for T timesteps (default T = 18,550,395 ticks = 365
+days at 1.7 s per tick). The time loop is compiled to machine code with Numba
+(@njit), and the N_SIM tortoises are simulated one after another on the CPU.
 
-BIOLOGICAL MODEL
-----------------
-The yearly cycle is divided into three behavioural stages, each with distinct
-movement rules:
+UNITS
+-----
+  Positions and step lengths : centimetres (cm)
+  Time                       : ticks (1 tick = seconds_per_time_step, default 1.7 s)
 
-  Stage 0 — Exploration (days 0 to day_exploration_end):
-    The tortoise performs a correlated random walk (CRW). Every night it
-    registers its sleeping position as a potential refuge (attractor point).
-    Walk and stop durations are drawn from a power-law distribution. The
-    upper cap on each bout equals min(Max_time_mov/freeze, remaining_day) so
-    the tortoise cannot start a bout it cannot finish before dark.
+MOVEMENT RULES
+--------------
+  Step length : LogNormal(mu_vel, sigma_vel), redrawn until <= data_max (5.67 cm).
+  Heading     : previous heading + Gaussian noise of s.d. angular_sigma (rad),
+                i.e. a correlated random walk (CRW).
+  Guided walk : in stages 1 and 2 the heading first turns towards the target
+                by at most e_theta = 5 degrees per tick, then noise is added.
+  Bouts       : walking and stopping alternate. Bout durations are drawn from
+                truncated power laws P(t) ~ t^alpha (alpha_walk, alpha_stop),
+                capped by Max_time_mov / Max_time_freeze AND by the time left
+                until 20:00.
 
-  Stage 1 — Intermediate / Homing (days day_exploration_end to day_brumation_begin):
-    At dawn the tortoise selects a random attractor from its accumulated list
-    and walks toward it using a biased guided walk. It stops moving for the
-    rest of the day once it arrives at the target burrow (arrived_at_burrow).
-    Walk/stop alternation persists during the approach.
+DAILY RHYTHM -- RESET MODEL
+---------------------------
+  Night (20:00 - 08:00) : no movement.
+  Dawn  (08:00)         : behaviour is reset. The tortoise always starts the
+                          day walking, with a newly drawn walk bout.
+  Day   (08:00 - 20:00) : movement follows the stage rules below.
 
-  Stage 2 — Pre-brumation (days day_brumation_begin to day_brumation_end):
-    On the first tick of this stage the tortoise identifies the 5 closest
-    attractors within a 1 km radius and restricts its daily targets to that
-    shortlist. Each dawn it selects one of those 5 at random and walks toward
-    it with a stronger heading bias (e_theta), again stopping once it arrives.
-    This mimics the tortoise returning to a winter hibernation refuge.
+  Because every bout is capped to finish before 20:00, no bout ever spans a
+  night: each day starts from scratch. This is the key difference from the GPU
+  version (GPU_FINAL_Noches_v2.py), in which rest bouts can continue through
+  the night.
 
-DAILY RHYTHM
-------------
-  Night  : 20:00 – 08:00  (no movement)
-    At exactly 20:00 in stage 0 the current position is registered as an
-    attractor (the tortoise chose a sleeping spot for the night).
+YEARLY STAGES  (calendar day = (t // ticks_per_day) % 365)
+--------------------------------------------------------
+  Stage 0 -- Exploration, days [0, day_exploration_end) and [day_brumation_end, 365):
+    Free CRW with walk/stop bouts. At 20:00 every night the sleeping position
+    is stored as a refuge ("attractor"). The origin (0, 0) is pre-registered
+    as the home refuge.
 
-  Dawn reset (08:00):
-    Walk/stop counters reset; a fresh walk_time is drawn for the day;
-    for stages 1 and 2 the daily target attractor is also selected here.
+  Stage 1 -- Intermediate / homing, days [day_exploration_end, day_brumation_begin):
+    Each dawn a target is chosen uniformly among the refuges within
+    stage1_radius (the calibrated mean daily displacement, see CALIBRATION);
+    if none qualify, any refuge is chosen. The tortoise performs a guided walk
+    towards it and, once within 30 cm of the target, rests for the rest of
+    the day.
 
-  Day    : 08:00 – 20:00  (movement governed by the active stage rules)
+  Stage 2 -- Pre-brumation, days [day_brumation_begin, day_brumation_end):
+    On the first tick of the stage a shortlist of up to 5 nearest refuges
+    within stage2_radius = stage2_radius_fraction x stage1_radius is built
+    (fallback: all refuges). Each dawn one of them is chosen at random and the
+    same guided walk and rest-on-arrival rule as in stage 1 is applied.
+    Note: movement is not switched off during brumation itself; stage 2
+    represents homing to a small set of winter refuges.
 
-WALK / STOP DYNAMICS
---------------------
-  Walk and stop durations are drawn from a truncated power-law distribution
-  with upper bound min(Max_time_mov or Max_time_freeze, remaining_day).
-  Using remaining_day as the upper bound ensures a new bout always fits within
-  the current day window. Counters reset every dawn so each day starts fresh.
+CALIBRATION OF THE STAGE-1 RADIUS
+---------------------------------
+  Before the main simulation, 500 replicas of one active day are run with the
+  same walk/stop rules and a guided walk towards a very distant target. The
+  mean net displacement is used as stage1_radius, so the target-selection
+  radius is consistent with the movement parameters in use.
 
-MSD — ENSEMBLE APPROACH
+MSD -- MEMORY-EFFICIENT ENSEMBLE ESTIMATE
+-----------------------------------------
+  Storing full trajectories (N_SIM x T x 2) would require ~300 GB for 1,000
+  tortoises over one year, so
+  positions are stored only at selected "snapshot" ticks:
+    - n_refs = 48 reference times per stage, 30 min apart, covering day 2 of
+      the stage (from 00:00), so the transient from (0, 0) has decayed;
+    - lags tau_k = round(1.5^k) until the end of the stage.
+  MSD(tau) = mean over tortoises and reference times of |r(t_ref + tau) - r(t_ref)|^2
+  SEM(tau) = sqrt(var(r^2) / N), with N = N_SIM x n_refs pooled pairs.
+  Note: pairs from the same tortoise are correlated, so this SEM is a lower
+  bound. The GPU version averages over reference times per tortoise first.
+
+DISPLACEMENT HISTOGRAMS
 -----------------------
-  To avoid storing the full (N_SIM × T × 2) trajectory, which can reach tens
-  of GB for large T, the MSD is computed as an ensemble average over tortoises
-  rather than a time average over a single trajectory.
-
-  For each stage a reference time t_ref is chosen: day 2 of the stage at 11 AM.
-  Using day 2 ensures the initial transient from position (0, 0) has decayed
-  and the walk/stop daily rhythm is fully established.
-
-  Position snapshots are recorded only at:
-    - t_ref itself       (the reference position for this stage)
-    - t_ref + tau_k      for tau_k = round(2^k), k = 0, 1, 2, ...
-      while t_ref + tau_k remains within the stage window
-
-  This produces ~20 logarithmically spaced lag times per stage (~60 total),
-  requiring only ~60 × N_SIM × 2 × 8 bytes of storage instead of T × N_SIM × 2 × 8.
-
-  MSD(tau) = < |r(t_ref + tau) - r(t_ref)|^2 >  averaged over N_SIM tortoises
-  SEM(tau) = std(r^2) / sqrt(N_SIM)              standard error of the mean
-
-DELTA DISTANCES
----------------
-  Every Delta_T timesteps the displacement since the previous sample is computed
-  and stored, separately for each behavioural stage. Night ticks are excluded
-  because the position is frozen there; including them would add spurious zero-
-  distance entries to the histogram. The raw values are never written to disk;
-  instead a normalised histogram with Poisson errors is saved per stage.
+  Every Delta_T ticks during daytime, the distance moved since the previous
+  sample is stored for the current stage. Night ticks are skipped and zero
+  displacements are discarded, so the histogram describes movement only.
+  Fixed bin edges on [0, data_max x Delta_T] make CPU and GPU histograms
+  directly comparable.
 
 OUTPUT FILES  (written to folder_name/sub_folder_name/)
 -------------------------------------------------------
-  snapshot_times.npy                    — absolute timesteps of all snapshots
-  all_snap_x.npy                        — (N_SIM, n_snaps) x-positions at snaps
-  all_snap_y.npy                        — (N_SIM, n_snaps) y-positions at snaps
-  Attractors.txt                        — attractor positions from the first run
-  t_refs.csv                            — reference timestep per stage (3 values)
-  taus_{stage}.csv                      — lag values for each stage
-  msd_{stage}.csv                       — columns: msd, sem
-  Delta_distances_histogram_{stage}.csv — columns: bin_center, frequency, error
-  example_trajectory.npy                — (n_traj_points, 2) x/y positions of
-                                          the first tortoise, sampled every
-                                          traj_every ticks (default ~1 hour)
-  example_attractors.npy                — (n_attractors, 2) burrow positions
-                                          registered by the first tortoise
+  snapshot_times.npy                    -- absolute ticks of all snapshots
+  t_refs.csv                            -- first reference tick of each stage
+  taus_{stage}.csv                      -- lag values (ticks) for each stage
+  msd_{stage}.csv                       -- columns: msd, sem
+  Delta_distances_histogram_{stage}.csv -- columns: distance, frequency, poisson_error
+  Attractors.txt                        -- refuge positions of the first tortoise
+  example_trajectory.npy                -- (n_points, 2) x/y of the first tortoise,
+                                           sampled every traj_every ticks (~1 h)
+  example_attractors.npy                -- (n_attractors, 2) refuges of the first tortoise
+  where {stage} is exploration, intermediate or prebrumation.
 
 USAGE
 -----
   python LogNormal_CPU_FINAL.py --T 18550395 --simulation_runs 1000 [options]
-  See the CLI section at the bottom for all arguments and their defaults.
+  See the command-line interface at the bottom for all arguments.
 
 DEPENDENCIES
 ------------
-  numpy, numba (njit + typed List), argparse, os, time
+  numpy, numba
 ================================================================================
 """
 
@@ -124,28 +127,32 @@ from numba.typed import List
 # Default values — all can be overridden via CLI arguments.
 # ==============================================================================
 
-data_max        = 5.6667   # maximum allowed step length in metres (lognormal cap)
+data_max        = 5.6667   # maximum allowed step length in cm (lognormal rejection cap)
 angular_sigma   = 0.5      # std deviation of angular noise in radians
 sigma_vel       = 0.83     # lognormal sigma for step-length distribution
 mu_vel          = 0.82     # lognormal mu for step-length distribution
 simulation_runs = 1000     # number of independent tortoise trajectories
 Delta_T         = 500      # timestep interval between displacement samples
 
-# Walk/stop duration limits in timesteps.
-# Max_time_mov    ≈ 2.79 hours  (upper bound for a single walk bout)
-# Max_time_freeze ≈ 27.7 hours  (upper bound for a single stop bout)
+# Walk/stop duration limits in ticks (at 1.7 s per tick).
+# Max_time_mov    ≈ 2.8 hours   (upper bound for a single walk bout)
+# Max_time_freeze ≈ 27.8 hours  (upper bound for a single stop bout; in practice
+#                                 stops are also capped by the time left until 20:00)
 Max_time_mov    = 5930
 Max_time_freeze = 58871
 
 # Temporal discretisation
 seconds_per_time_step = 1.7   # seconds per simulation timestep
 
-# Yearly stage boundaries in calendar days (day 0 = 1 January)
-day_exploration_end  = 30    # last day of the exploration stage
-day_brumation_begin  = 90    # first day of pre-brumation homing
-day_brumation_end    = 304   # last day of brumation (tortoise re-emerges after this)
+# Yearly stage boundaries in calendar days (day 0 = 1 January); each stage
+# includes its first day and excludes its last.
+day_exploration_end  = 30    # first day of stage 1 (end of exploration)
+day_brumation_begin  = 90    # first day of stage 2 (pre-brumation homing)
+day_brumation_end    = 304   # first day after stage 2; exploration resumes
 
-# Derived temporal constants (also recomputed inside main() from CLI args)
+# Derived temporal constants, used inside the @njit functions.
+# Note: these use the default 1.7 s per tick; main() recomputes them locally
+# for the calibration and snapshot grid.
 night_begins     = int(20*60*60 / seconds_per_time_step)   # 8 PM in ticks
 night_ends       = int( 8*60*60 / seconds_per_time_step)   # 8 AM in ticks
 tic_per_day      = int(24*60*60 / seconds_per_time_step)   # ticks per 24 h
@@ -156,9 +163,8 @@ Mean_Angular_Var = np.pi / 36
 
 # ==============================================================================
 # NUMBA JIT FUNCTIONS
-# All functions decorated with @njit are compiled to native machine code on
-# first call and run at C speed on subsequent calls. Python built-ins like
-# min() are available here (unlike CUDA kernels).
+# Functions decorated with @njit are compiled to machine code on their first
+# call, so later calls run at compiled speed.
 # ==============================================================================
 
 @njit
@@ -166,8 +172,9 @@ def powerlaw_stop_interval(alpha=-2, min_time=1, max_time=1000):
     """
     Draw a random duration from a truncated power-law distribution P(x) ~ x^alpha
     on the interval [min_time, max_time] using the inverse-CDF method.
+    Used for both walk and stop bouts (the name is historical).
 
-    Special case alpha == -1 gives a log-uniform (Pareto) distribution.
+    Special case alpha == -1: P(x) ~ 1/x, i.e. a log-uniform distribution.
     """
     u = np.random.uniform(0, 1)
     if alpha == -1:
@@ -182,9 +189,9 @@ def gaussian_angle_lognormal_step(r0x, r0y, theta0, mu_vel, sigma_r, angular_sig
     """
     Advance position by one correlated random-walk step.
 
-    The new heading is sampled from Normal(theta0, angular_sigma) and wrapped
-    to [-pi, pi]. Step length is drawn from LogNormal(mu_vel, sigma_r) with
-    rejection sampling until the draw falls below data_max.
+    The new heading is sampled from Normal(theta0, angular_sigma), i.e. the
+    previous heading plus noise, and wrapped to [-pi, pi]. The step length (cm)
+    is drawn from LogNormal(mu_vel, sigma_r), redrawn until it is <= data_max.
 
     Returns new (x, y, heading).
     """
@@ -238,8 +245,8 @@ def guided_walker(x_0, y_0, theta_0, e_theta, target_point, mu_vel, sigma_r, ang
 def create_attraction_points(pos):
     """
     Register a position as a refuge (attractor) with a random fitness value
-    drawn from Uniform(0, 1). Returns a (position_array, fitness) tuple
-    compatible with the Numba typed list used in simulate_single_run.
+    drawn from Uniform(0, 1). Returns a (position_array, fitness) tuple.
+    Note: the fitness value is stored but not currently used in target choice.
     """
     point     = pos
     fitness   = np.random.random()
@@ -250,8 +257,8 @@ def create_attraction_points(pos):
 @njit
 def in_burrow(x, y, ref):
     """
-    Return True if (x, y) is within 30 m of the attractor referenced by ref.
-    Uses squared distance (threshold = 900 m²) to avoid the square-root.
+    Return True if (x, y) is within 30 cm of the attractor referenced by ref.
+    Uses squared distance (threshold = 900 cm^2) to avoid the square root.
     """
     ref_x = ref[0][0]
     ref_y = ref[0][1]
@@ -275,7 +282,7 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
     alpha_stop     : power-law exponent for stop durations
     alpha_walk     : power-law exponent for walk durations
     Delta_T        : interval between displacement samples (ticks)
-    stages         : int64 array of length T — behavioural stage at each tick
+    stages         : int64 array of length T — yearly stage at each tick
     snapshot_times : int64 array — absolute timesteps at which to record position
     n_snaps        : length of snapshot_times
     traj_x         : float64 array of length (T // traj_every + 1) — written when
@@ -283,12 +290,15 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
     traj_y         : same as traj_x for the y coordinate
     traj_every     : int — ticks between trajectory samples
     save_traj      : bool — True only for the first run (run 0)
+    stage1_radius2 : squared radius (cm^2) for stage-1 target selection
+    stage2_radius2 : squared radius (cm^2) for the stage-2 shortlist
 
     Returns
     -------
     snap_x, snap_y           : float64 arrays, shape (n_snaps,)
     delta_distances_{0,1,2}  : float64 arrays, displacement samples per stage
     attr_arr                 : (N_attractors, 2) float64 array of attractor xy
+    missed_burrow_days       : number of stage-1/2 days the target was not reached
     """
 
     # The home burrow at the origin is pre-registered as the first attractor
@@ -319,8 +329,10 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
     snap_y   = np.zeros(n_snaps)
     snap_ptr = 0   # forward pointer into the sorted snapshot_times array
 
-    # Candidate buffer for stage-1 uniform-within-radius selection.
-    # Over-allocated to MAX_ATTR=50; at most 30 attractors are ever registered.
+    # Candidate buffer for stage-1 uniform-within-radius selection (size 50).
+    # In the first simulated year at most 31 refuges exist when stage 1 runs
+    # (origin + one per exploration night). Simulations longer than one year
+    # accumulate more refuges and would need a larger buffer.
     stage1_candidates = np.empty(50, dtype=np.int64)
 
     # Per-stage displacement sample arrays (over-allocated; sliced on return)
@@ -347,8 +359,7 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
         # The tortoise does not move at night. At exactly 20:00 in stage 0 the
         # current sleeping position is registered as a new attractor. Snapshots
         # are still recorded if this tick is a designated snapshot time.
-        # Delta distances are NOT sampled at night because the position is frozen;
-        # zero-distance entries would inflate the histogram near 0 with no signal.
+        # Displacements are not sampled at night because the position is frozen.
         # ======================================================================
         if time_in_day >= night_begins or time_in_day < night_ends:
 
@@ -367,11 +378,11 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
             continue   # skip all movement and accumulation for this tick
 
         # ======================================================================
-        # DAWN RESET  (exactly 08:00 each day)
-        # Reset walk/stop counters and draw a fresh walk duration for the day.
-        # The cap is min(Max_time_mov, full_daytime_window) so the draw is always
-        # a valid positive interval. For stages 1 and 2, the daily target
-        # attractor is selected here and arrived_at_burrow is initialised.
+        # DAWN RESET  (exactly 08:00 each day) -- the "nightly reset"
+        # Whatever the tortoise did the previous evening, it starts the day
+        # walking: counters are reset and a fresh walk bout is drawn, capped at
+        # min(Max_time_mov, length of the daytime window). For stages 1 and 2
+        # the daily target is selected further below, at the same tick.
         # ======================================================================
         if time_in_day == night_ends:
             WALK              = True
@@ -395,7 +406,7 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
         remaining_day = night_begins - time_in_day
 
         # ----------------------------------------------------------------------
-        # STAGE 0 — Exploration: uncorrelated random walk with walk/stop bouts
+        # STAGE 0 — Exploration: correlated random walk with walk/stop bouts
         # ----------------------------------------------------------------------
         if stage == 0:
             if WALK:
@@ -482,14 +493,14 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
                         count_stop_time = 0
 
         # ----------------------------------------------------------------------
-        # STAGE 2 — Pre-brumation: homing toward the 5 nearest attractors
+        # STAGE 2 — Pre-brumation: homing toward up to 5 nearest attractors
         # ----------------------------------------------------------------------
         else:
 
             if first_brumation_step:
-                # Build the shortlist of the 5 nearest attractors within 1 km.
-                # If none qualify, fall back to the full list so the tortoise
-                # always has a valid target.
+                # On the first tick of stage 2, build the shortlist of up to 5
+                # nearest attractors within stage2_radius. If none qualify, fall
+                # back to the full list so the tortoise always has a valid target.
                 Closest_Attraction_points = List()
                 best_distances = np.full(5, 1e18)
                 best_points    = List()
@@ -578,11 +589,12 @@ def simulate_single_run(T, mu_vel, sigma_vel, angular_sigma, alpha_stop, alpha_w
             snap_ptr += 1
 
         # ======================================================================
-        # DELTA DISTANCE SAMPLE
+        # DELTA DISTANCE SAMPLE (daytime ticks only)
         # Every Delta_T ticks compute the displacement from the previous sample
         # and store it in the array for the current stage. The reference position
         # old_x/old_y is shared across stages: a sample straddling a stage
         # boundary is attributed to the stage at time t (the new stage).
+        # Zero displacements are removed later, when the histogram is built.
         # ======================================================================
         if t % Delta_T == 0:
             dist = np.sqrt((x - old_x)**2 + (y - old_y)**2)
@@ -628,6 +640,9 @@ def calibrate_stage1_radius(mu_vel, sigma_vel, angular_sigma, alpha_walk, alpha_
     directly determines what fraction of the day the tortoise is moving, so the
     calibrated radius automatically reflects the current alpha_walk / alpha_stop
     parameters.
+
+    The walk/stop rules match this CPU simulation: each replica starts walking
+    at dawn and no bout extends past 20:00.
 
     Returns the mean end-of-day displacement in cm — used directly as
     stage1_radius so the filter is self-consistent with the simulation dynamics.
@@ -705,7 +720,7 @@ def compute_stages_cpu(T, seconds_per_time_step,
     Build an integer stage-index array of length T.
     The yearly calendar wraps modulo 365 so multi-year simulations are supported.
     Values: 0 = exploration, 1 = intermediate, 2 = pre-brumation.
-    Post-brumation days map back to stage 0 (exploration resumes).
+    Days after day_brumation_end map back to stage 0 (exploration resumes).
     """
     tic_per_day = int(24*60*60 / seconds_per_time_step)
     stages = np.zeros(T, dtype=np.int64)
@@ -725,9 +740,10 @@ def compute_snapshot_times(T, tic_per_day, night_ends_val,
     """
     Precompute snapshot timesteps for an ensemble MSD averaged over multiple
     reference times. For each stage, n_refs reference times are placed on day 2
-    of the stage, spaced ref_spacing_minutes apart and covering 24 hours. The
-    lag grid is the same for all reference times within a stage, capped by the
-    last (most restrictive) reference time so every ref has the full lag range.
+    of the stage, starting at 00:00, spaced ref_spacing_minutes apart (default
+    48 x 30 min = 24 h). Lags are tau_k = round(base^k). The lag grid is the
+    same for all reference times within a stage, capped by the last (most
+    restrictive) reference time so every reference has the full lag range.
 
     Returns
     -------
@@ -799,7 +815,8 @@ def accumulate_msd_single(snap_x, snap_y, ref_snap_idxs, lag_snap_idxs, taus_per
     Accumulate MSD statistics from one run's snapshot positions.
 
     snap_x, snap_y : 1D float64 arrays of shape (n_snaps,)
-    Modifies msd_sum_r2, msd_sum_r4, msd_count in-place.
+    Modifies msd_sum_r2, msd_sum_r4, msd_count in-place. Every (tortoise,
+    reference time) pair is counted as one sample.
     """
     for s in range(3):
         r_idxs = ref_snap_idxs[s]           # (n_refs,)
@@ -824,6 +841,8 @@ def finalize_msd(msd_sum_r2, msd_sum_r4, msd_count, taus_per_stage):
     """
     Compute final MSD and SEM from accumulated sums.
     SEM is derived from the variance of r²: var(r²) = E[r⁴] - E[r²]².
+    Because all (tortoise, reference) pairs are pooled and pairs from the same
+    tortoise are correlated, this SEM is a lower bound.
     Returns list of (taus, msd, sem) per stage.
     """
     results = []
@@ -887,8 +906,8 @@ def main(T, seconds_per_time_step, mean_r, sigma_r, angular_sigma,
     night_begins_l = int(20*60*60 / seconds_per_time_step)
 
     # ── Stage 1 radius calibration ────────────────────────────────────────────
-    # Simulate walk/stop dynamics for one full day (500 reps) toward an
-    # infinitely distant target to estimate the mean reachable displacement.
+    # Simulate walk/stop dynamics for one full day (500 reps) toward a very
+    # distant target to estimate the mean reachable displacement (cm).
     print("Calibrating stage 1 radius (500 reps)...")
     stage1_radius_cm = calibrate_stage1_radius(
         mean_r, sigma_r, angular_sigma, alpha_walk, alpha_stop,
@@ -926,7 +945,8 @@ def main(T, seconds_per_time_step, mean_r, sigma_r, angular_sigma,
     for s, (t_refs, taus) in enumerate(zip(t_refs_per_stage, taus_per_stage)):
         print(f"  Stage {s} ({stage_names[s]}): {len(t_refs)} refs, {len(taus)} lags each")
 
-    # Incremental MSD accumulators — avoids storing (N_SIM, n_snaps) arrays.
+    # Incremental MSD accumulators — each run is added and then discarded,
+    # so no (N_SIM, n_snaps) array is ever stored.
     msd_sum_r2 = [np.zeros(len(taus), dtype=np.float64) for taus in taus_per_stage]
     msd_sum_r4 = [np.zeros(len(taus), dtype=np.float64) for taus in taus_per_stage]
     msd_count  = [np.zeros(len(taus), dtype=np.int64)   for taus in taus_per_stage]
@@ -943,7 +963,8 @@ def main(T, seconds_per_time_step, mean_r, sigma_r, angular_sigma,
     traj_y_example  = np.zeros(n_traj_pts)
     dummy_traj      = np.zeros(1)
 
-    # Fixed histogram parameters — identical to GPU so frequencies are comparable.
+    # Fixed histogram range [0, data_max * Delta_T] cm — the largest possible
+    # displacement between samples. Same convention as the GPU version.
     max_dist  = 5.6667 * Delta_T
 
     # Numba requires int64 for comparisons inside the @njit kernel
@@ -1031,7 +1052,9 @@ def main(T, seconds_per_time_step, mean_r, sigma_r, angular_sigma,
     print(f"All simulations completed. Runtime: {elapsed:.1f} s")
 
     # Days in stages 1/2 where the tortoise never reached its target burrow.
-    # A high count may indicate the radius is too small or Max_time_mov too short.
+    # A high count may indicate the radius is too large or Max_time_mov too short.
+    # (homing_days and total_homing_days are computed for reference but are
+    # not currently printed.)
     homing_days = (day_brumation_begin - day_exploration_end + day_brumation_end - day_brumation_begin)
     total_homing_days = homing_days * (T // int(24*60*60 / seconds_per_time_step) // 365 or 1) * simulation_runs
     print(f"Days burrow not reached (stages 1+2): {total_missed_days} "
@@ -1044,21 +1067,21 @@ def main(T, seconds_per_time_step, mean_r, sigma_r, angular_sigma,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Tortoise yearly cycle simulation — CPU version")
+        description="Patagonian tortoise yearly cycle simulation — CPU version (nightly reset model)")
     parser.add_argument('--T',                     type=int,   default=18550395,
                         help="Total timesteps (default: one full year at 1.7 s/step)")
     parser.add_argument('--seconds_per_time_step', type=float, default=1.7,
                         help="Duration of each timestep in seconds")
     parser.add_argument('--mu_vel',                type=float, default=0.82,
-                        help="Lognormal mu for step-length distribution")
+                        help="Lognormal mu for step-length distribution (step in cm)")
     parser.add_argument('--sigma_vel',             type=float, default=0.83,
                         help="Lognormal sigma for step-length distribution")
     parser.add_argument('--angular_sigma',         type=float, default=0.5,
                         help="Std of angular noise in radians")
     parser.add_argument('--alpha_stop',            type=float, default=-2.0,
-                        help="Power-law exponent for stop durations")
+                        help="Power-law exponent for stop durations, P(t) ~ t^alpha")
     parser.add_argument('--alpha_walk',            type=float, default=-2.0,
-                        help="Power-law exponent for walk durations")
+                        help="Power-law exponent for walk durations, P(t) ~ t^alpha")
     parser.add_argument('--simulation_runs',       type=int,   default=1000,
                         help="Number of independent tortoise trajectories")
     parser.add_argument('--Delta_T',               type=int,   default=500,
